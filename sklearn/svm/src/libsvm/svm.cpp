@@ -59,6 +59,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
    - Exposed number of iterations run in optimization, Juan Martín Loyola.
      See <https://github.com/scikit-learn/scikit-learn/pull/21408/>
+
+   Modified 2024:
+
+   - Fix inconsistency that could cause the optimization algorithm to oscillate.
+     By Darren Mo.
  */
 
 #include <math.h>
@@ -277,6 +282,37 @@ void Cache::swap_index(int i, int j)
 	}
 }
 
+// Provides access to the elements in a single column of a QMatrix.
+class QColumn {
+public:
+   QColumn(const Qfloat *values, int column_idx, double diagonal_value)
+   : values(values), column_idx(column_idx), diagonal_value(diagonal_value) {
+   }
+
+   double operator[](int row_idx) const {
+      if (row_idx != column_idx) {
+         return values[row_idx];
+      } else {
+         // Return the value from the QD array so that calculations stay
+         // consistent, regardless of whether QColumn or the QD array
+         // are used.
+         //
+         // QD array is double precision while Qfloat could be single
+         // precision, so the diagonal values could be very different
+         // between the two. If one calculation uses QColumn while
+         // another calculation uses the QD array, the optimization
+         // algorithm may not converge.
+         return diagonal_value;
+      }
+   }
+
+private:
+   const Qfloat *values;
+
+   int column_idx;
+   double diagonal_value;
+};
+
 //
 // Kernel evaluation
 //
@@ -286,7 +322,7 @@ void Cache::swap_index(int i, int j)
 //
 class QMatrix {
 public:
-	virtual Qfloat *get_Q(int column, int len) const = 0;
+	virtual QColumn get_Q(int column, int len) const = 0;
 	virtual double *get_QD() const = 0;
 	virtual void swap_index(int i, int j) const = 0;
 	virtual ~QMatrix() {}
@@ -303,7 +339,7 @@ public:
 
 	static double k_function(const PREFIX(node) *x, const PREFIX(node) *y,
 				 const svm_parameter& param, BlasFunctions *blas_functions);
-	virtual Qfloat *get_Q(int column, int len) const = 0;
+	virtual QColumn get_Q(int column, int len) const = 0;
 	virtual double *get_QD() const = 0;
 	virtual void swap_index(int i, int j) const	// no so const...
 	{
@@ -641,7 +677,7 @@ void Solver::reconstruct_gradient()
 	{
 		for(i=active_size;i<l;i++)
 		{
-			const Qfloat *Q_i = Q->get_Q(i,active_size);
+			QColumn Q_i = Q->get_Q(i,active_size);
 			for(j=0;j<active_size;j++)
 				if(is_free(j))
 					G[i] += alpha[j] * Q_i[j];
@@ -652,7 +688,7 @@ void Solver::reconstruct_gradient()
 		for(i=0;i<active_size;i++)
 			if(is_free(i))
 			{
-				const Qfloat *Q_i = Q->get_Q(i,l);
+				QColumn Q_i = Q->get_Q(i,l);
 				double alpha_i = alpha[i];
 				for(j=active_size;j<l;j++)
 					G[j] += alpha_i * Q_i[j];
@@ -703,7 +739,7 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 		for(i=0;i<l;i++)
 			if(!is_lower_bound(i))
 			{
-				const Qfloat *Q_i = Q.get_Q(i,l);
+				QColumn Q_i = Q.get_Q(i,l);
 				double alpha_i = alpha[i];
 				int j;
 				for(j=0;j<l;j++)
@@ -755,8 +791,8 @@ void Solver::Solve(int l, const QMatrix& Q, const double *p_, const schar *y_,
 
 		// update alpha[i] and alpha[j], handle bounds carefully
 
-		const Qfloat *Q_i = Q.get_Q(i,active_size);
-		const Qfloat *Q_j = Q.get_Q(j,active_size);
+		QColumn Q_i = Q.get_Q(i,active_size);
+		QColumn Q_j = Q.get_Q(j,active_size);
 
 		double C_i = get_C(i);
 		double C_j = get_C(j);
@@ -975,9 +1011,11 @@ int Solver::select_working_set(int &out_i, int &out_j)
 		}
 
 	int i = Gmax_idx;
-	const Qfloat *Q_i = NULL;
-	if(i != -1) // NULL Q_i not accessed: Gmax=-INF if i=-1
-		Q_i = Q->get_Q(i,active_size);
+	if (i == -1) {
+	   return 1;
+	}
+
+	QColumn Q_i = Q->get_Q(i,active_size);
 
 	for(int j=0;j<active_size;j++)
 	{
@@ -1224,8 +1262,8 @@ int Solver_NU::select_working_set(int &out_i, int &out_j)
 
 	int ip = Gmaxp_idx;
 	int in = Gmaxn_idx;
-	const Qfloat *Q_ip = NULL;
-	const Qfloat *Q_in = NULL;
+	QColumn Q_ip = QColumn(NULL, -1, 0);
+	QColumn Q_in = QColumn(NULL, -1, 0);
 	if(ip != -1) // NULL Q_ip not accessed: Gmaxp=-INF if ip=-1
 		Q_ip = Q->get_Q(ip,active_size);
 	if(in != -1)
@@ -1433,7 +1471,7 @@ public:
 			QD[i] = (this->*kernel_function)(i,i);
 	}
 
-	Qfloat *get_Q(int i, int len) const
+	QColumn get_Q(int i, int len) const
 	{
 		Qfloat *data;
 		int start, j;
@@ -1442,7 +1480,7 @@ public:
 			for(j=start;j<len;j++)
 				data[j] = (Qfloat)(y[i]*y[j]*(this->*kernel_function)(i,j));
 		}
-		return data;
+		return QColumn(data, i, QD[i]);
 	}
 
 	double *get_QD() const
@@ -1482,7 +1520,7 @@ public:
 			QD[i] = (this->*kernel_function)(i,i);
 	}
 
-	Qfloat *get_Q(int i, int len) const
+	QColumn get_Q(int i, int len) const
 	{
 		Qfloat *data;
 		int start, j;
@@ -1491,7 +1529,7 @@ public:
 			for(j=start;j<len;j++)
 				data[j] = (Qfloat)(this->*kernel_function)(i,j);
 		}
-		return data;
+		return QColumn(data, i, QD[i]);
 	}
 
 	double *get_QD() const
@@ -1548,7 +1586,7 @@ public:
 		swap(QD[i],QD[j]);
 	}
 
-	Qfloat *get_Q(int i, int len) const
+	QColumn get_Q(int i, int len) const
 	{
 		Qfloat *data;
 		int j, real_i = index[i];
@@ -1564,7 +1602,7 @@ public:
 		schar si = sign[i];
 		for(j=0;j<len;j++)
 			buf[j] = (Qfloat) si * (Qfloat) sign[j] * data[index[j]];
-		return buf;
+		return QColumn(buf, i, QD[i]);
 	}
 
 	double *get_QD() const
